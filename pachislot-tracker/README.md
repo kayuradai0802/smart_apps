@@ -23,3 +23,22 @@ npm run dev
 ```bash
 npm run build
 ```
+
+## スマホへのインストール（PWA）
+
+このアプリは PWA（Progressive Web App）対応済みです。GitHub Pages にデプロイ後、スマホのブラウザでアクセスし「ホーム画面に追加」するとアプリのように起動できます。
+
+### 1. GitHub Pages を有効化（初回のみ）
+
+このリポジトリの Settings → Pages → Build and deployment → Source で **GitHub Actions** を選択してください。
+
+### 2. デプロイ
+
+`main` ブランチに `pachislot-tracker/` の変更が push されると、`.github/workflows/deploy-pachislot-tracker.yml` が自動でビルドして GitHub Pages に公開します（Actions タブから手動実行も可能）。
+
+公開URL: `https://<GitHubユーザー名>.github.io/smart_apps/`
+
+### 3. ホーム画面に追加
+
+- **iPhone (Safari)**: 上記URLを開く → 共有ボタン → 「ホーム画面に追加」
+- **Android (Chrome)**: 上記URLを開く → メニュー → 「アプリをインストール」または「ホーム画面に追加」
