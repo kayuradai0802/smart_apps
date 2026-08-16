@@ -65,16 +65,6 @@ def sawtooth(freq: float, duration: float) -> np.ndarray:
     return 2 * frac - 1
 
 
-def rich_lead_wave(freq: float, duration: float) -> np.ndarray:
-    """矩形波+ノコギリ波をブレンドした、芯としゃりの両方を持つリード波形。"""
-    return 0.6 * square(freq, duration) + 0.4 * sawtooth(freq, duration)
-
-
-def rich_bass_wave(freq: float, duration: float) -> np.ndarray:
-    """三角波+デューティ狭めの矩形波で太さを出すベース波形。"""
-    return 0.55 * triangle(freq, duration) + 0.45 * square(freq, duration, duty=0.3)
-
-
 def white_noise(duration: float, seed: int = 0) -> np.ndarray:
     rng = np.random.default_rng(seed)
     return rng.uniform(-1.0, 1.0, int(SR * duration))
@@ -267,6 +257,7 @@ def apply_reverb_circular(signal: np.ndarray, ir: np.ndarray, mix_amount: float 
 
 ROOM_IR = make_ir(0.7, 0.22, seed=901, low=250, high=9000)
 HALL_IR = make_ir(2.6, 0.9, seed=902, low=150, high=7000)
+PLATE_IR = make_ir(1.1, 0.32, seed=903, low=300, high=9500)
 
 
 # ---------------------------------------------------------------------------
@@ -286,7 +277,7 @@ def to_stereo(mono: np.ndarray, width_ms: float = 14.0) -> np.ndarray:
     return np.stack([left, right * 0.96])
 
 
-def normalize_stereo(stereo: np.ndarray, peak: float = 0.92) -> np.ndarray:
+def normalize_stereo(stereo: np.ndarray, peak: float = 0.85) -> np.ndarray:
     m = np.max(np.abs(stereo))
     if m == 0:
         return stereo
@@ -335,15 +326,168 @@ def wav_to_mp3(wav_path: str, mp3_path: str) -> None:
 
 
 def export(name: str, signal: np.ndarray, *, reverb_ir: np.ndarray | None = ROOM_IR, reverb_mix: float = 0.22,
-           loop: bool = False, width_ms: float = 14.0, saturate: float = 1.15) -> None:
+           loop: bool = False, width_ms: float = 14.0, saturate: float = 1.15,
+           already_stereo: bool = False) -> None:
     os.makedirs(OUT_DIR, exist_ok=True)
     wav_path = os.path.join(OUT_DIR, f"{name}.wav")
     mp3_path = os.path.join(OUT_DIR, f"{name}.mp3")
-    stereo = finalize(signal, reverb_ir=reverb_ir, reverb_mix=reverb_mix, loop=loop, width_ms=width_ms, saturate=saturate)
+    if already_stereo:
+        # 呼び出し側でステレオバスを組み立て済み（EDM 系ループなど）: サチュレーション + 正規化のみ行う。
+        stereo = soft_clip(signal, saturate) if saturate else signal
+        if not loop:
+            stereo = fade_edges_stereo(stereo)
+        stereo = normalize_stereo(stereo)
+    else:
+        stereo = finalize(signal, reverb_ir=reverb_ir, reverb_mix=reverb_mix, loop=loop, width_ms=width_ms, saturate=saturate)
     write_wav(wav_path, stereo)
     wav_to_mp3(wav_path, mp3_path)
     os.remove(wav_path)
     print(f"generated {mp3_path}")
+
+
+# ---------------------------------------------------------------------------
+# EDM/トランス系ヘルパー（動的フィルタ・サイドチェイン・ディレイ）
+# ---------------------------------------------------------------------------
+
+def time_varying_filter(signal: np.ndarray, filter_fn, chunk_ms: float = 25.0) -> np.ndarray:
+    """短いチャンクに分けて overlap-add することで、時間変化するフィルタ（ワブル/ライザー等）を実現する。"""
+    n = len(signal)
+    chunk = max(64, int(SR * chunk_ms / 1000))
+    hop = chunk // 2
+    window = np.hanning(chunk)
+    out = np.zeros(n + chunk)
+    norm = np.zeros(n + chunk)
+    pos = 0
+    while pos < n:
+        seg = signal[pos:pos + chunk]
+        if len(seg) < chunk:
+            seg = np.pad(seg, (0, chunk - len(seg)))
+        filtered = filter_fn(seg, pos / SR)
+        out[pos:pos + chunk] += filtered * window
+        norm[pos:pos + chunk] += window
+        pos += hop
+    norm[norm == 0] = 1.0
+    return (out / norm)[:n]
+
+
+def time_varying_lowpass(signal: np.ndarray, cutoff_fn, chunk_ms: float = 25.0) -> np.ndarray:
+    return time_varying_filter(signal, lambda seg, t: smooth_lowpass(seg, cutoff_fn(t)), chunk_ms=chunk_ms)
+
+
+def time_varying_bandpass(signal: np.ndarray, low_fn, high_fn, chunk_ms: float = 25.0) -> np.ndarray:
+    return time_varying_filter(signal, lambda seg, t: smooth_bandpass(seg, low_fn(t), high_fn(t)), chunk_ms=chunk_ms)
+
+
+def pluck_wave(freq: float, duration: float, voices: int = 5, detune_cents: float = 14.0) -> np.ndarray:
+    """トランス系の「プラック」音: スーパーソウに、明るく開いて素早く閉じるフィルターエンベロープを掛ける。"""
+    raw = unison_wave(freq, duration, sawtooth, voices=voices, detune_cents=detune_cents)
+    decay_tau = max(duration * 0.35, 0.03)
+    return time_varying_lowpass(raw, lambda t: 7000 * math.exp(-t / decay_tau) + 700)
+
+
+def wobble_bass(freq: float, duration: float, lfo_hz: float = 4.0, cutoff_base: float = 350.0,
+                 cutoff_range: float = 900.0, voices: int = 3) -> np.ndarray:
+    """LFO でローパスのカットオフを揺らす EDM 的なうねりベース。"""
+    raw = unison_wave(freq, duration, sawtooth, voices=voices, detune_cents=6)
+    return time_varying_lowpass(
+        raw, lambda t: cutoff_base + cutoff_range * (0.5 + 0.5 * math.sin(2 * math.pi * lfo_hz * t)),
+    )
+
+
+def sidechain_env(n_samples: int, bpm: float, hit_beats: list[float], depth: float = 0.65,
+                   release_beats: float = 0.4, attack_s: float = 0.004) -> np.ndarray:
+    """キックに合わせて他レイヤーを一瞬ダッキングさせる「ポンピング」エンベロープ。"""
+    beat_dur = 60.0 / bpm
+    env = np.ones(n_samples)
+    attack_n = max(1, int(SR * attack_s))
+    release_n = max(1, int(SR * release_beats * beat_dur))
+    for b in hit_beats:
+        idx = int(SR * b * beat_dur)
+        if idx >= n_samples:
+            continue
+        dip_end = min(n_samples, idx + attack_n)
+        rec_end = min(n_samples, idx + attack_n + release_n)
+        if dip_end > idx:
+            env[idx:dip_end] = np.linspace(1.0, 1 - depth, dip_end - idx)
+        if rec_end > dip_end:
+            env[dip_end:rec_end] = np.linspace(1 - depth, 1.0, rec_end - dip_end)
+    return env
+
+
+def ping_pong_echo(mono: np.ndarray, delay_s: float = 0.18, feedback: float = 0.4, taps: int = 5,
+                    lowpass_start: float = 7000.0) -> np.ndarray:
+    """左右交互にこだまするピンポンディレイ（ウェット成分のみを返す。ドライとは呼び出し側で合成する）。"""
+    d = max(1, int(SR * delay_s))
+    n = len(mono) + d * (taps + 1)
+    left = np.zeros(n)
+    right = np.zeros(n)
+    side_right = True
+    pos = d
+    amp = 1.0
+    for i in range(taps):
+        amp *= feedback
+        cutoff = max(800.0, lowpass_start - i * 900)
+        tap = smooth_lowpass(mono, cutoff) * amp
+        bus = right if side_right else left
+        end = min(n, pos + len(tap))
+        if end > pos:
+            bus[pos:end] += tap[: end - pos]
+        pos += d
+        side_right = not side_right
+    return np.stack([left, right])
+
+
+def make_clap(duration: float = 0.22) -> np.ndarray:
+    """複数のノイズバーストを重ねた EDM 的なクラップ音。"""
+    n = int(SR * duration)
+    out = np.zeros(n)
+    for i, off in enumerate([0.0, 0.008, 0.016, 0.028]):
+        idx = int(SR * off)
+        burst_dur = 0.03
+        burst = smooth_bandpass(white_noise(burst_dur, seed=700 + i), 1000, 8000) * exp_decay(burst_dur, 0.012)
+        end = min(n, idx + len(burst))
+        if end > idx:
+            out[idx:end] += burst[: end - idx] * 0.8
+    tail = smooth_bandpass(white_noise(duration, seed=709), 1200, 6000) * exp_decay(duration, 0.06)
+    out += tail * 0.5
+    return soft_clip(out, 1.3)
+
+
+def gated_reverb(dry: np.ndarray, ir: np.ndarray, gate_s: float = 0.16, mix_amount: float = 0.5) -> np.ndarray:
+    """80's/EDM 的なゲートリバーブ: 尾を短く強制的に切ってパンチを保ったまま空間感を足す。"""
+    wet = fft_convolve(dry, ir)
+    gate_n = int(SR * gate_s)
+    if gate_n < len(wet):
+        fade = min(int(SR * 0.01), len(wet) - gate_n)
+        if fade > 0:
+            wet[gate_n:gate_n + fade] *= np.linspace(1, 0, fade)
+        wet[gate_n + fade:] = 0
+    wet_peak = np.max(np.abs(wet))
+    dry_peak = np.max(np.abs(dry)) if len(dry) else 0
+    if wet_peak > 0:
+        wet = wet / wet_peak * dry_peak
+    dry_padded = np.pad(dry, (0, len(wet) - len(dry)))
+    return dry_padded * (1 - mix_amount) + wet * mix_amount
+
+
+def make_riser_buildup(duration: float = 1.6) -> np.ndarray:
+    """ドロップ/ファンファーレ直前の緊張感を煽るライザー（上昇ノイズ+チャープ+着地インパクト）。"""
+    noise = white_noise(duration, seed=808)
+    swept = time_varying_bandpass(
+        noise,
+        lambda t: 200 + (t / duration) * 3000,
+        lambda t: 1200 + (t / duration) * 9000,
+    )
+    t = t_axis(duration)
+    rise_env = (t / duration) ** 1.5
+    chirp_freq = 200 + (t / duration) * 1600
+    chirp_phase = 2 * math.pi * np.cumsum(chirp_freq) / SR
+    chirp = np.sin(chirp_phase) * rise_env * 0.4
+    body = swept * rise_env + chirp
+    tail_hit = make_impact_hit(0.4)
+    body = np.pad(body, (0, max(0, len(tail_hit) - len(body))))
+    tail_hit = np.pad(tail_hit, (0, len(body) - len(tail_hit)))
+    return soft_clip(body * 0.8 + tail_hit * 0.7, 1.3)
 
 
 # ---------------------------------------------------------------------------
@@ -360,43 +504,9 @@ def make_kick(duration: float = 0.28) -> np.ndarray:
     return soft_clip(body * 1.1 + click * 0.6, 1.3)
 
 
-def make_snare(duration: float = 0.18) -> np.ndarray:
-    tone = sine(190, duration) * exp_decay(duration, 0.05) * 0.5
-    noise = smooth_bandpass(white_noise(duration, seed=502), 1200, 9000) * exp_decay(duration, 0.08)
-    return soft_clip(tone + noise * 1.1, 1.2)
-
-
 def make_hat(duration: float = 0.05, seed: int = 0, open_: bool = False) -> np.ndarray:
     tau = 0.22 if open_ else 0.035
     return smooth_bandpass(white_noise(duration, seed=seed), 6000, 14000) * exp_decay(duration, tau)
-
-
-def build_drum_bus(total_beats: int, bpm: float) -> np.ndarray:
-    """キック(1,3拍)+スネア(2,4拍)+8分ハットのフルなドラムバス。"""
-    beat_dur = 60.0 / bpm
-    n = int(SR * total_beats * beat_dur)
-    bus = np.zeros(n)
-
-    def place(sig: np.ndarray, beat_pos: float, gain: float = 1.0) -> None:
-        idx = int(SR * beat_pos * beat_dur)
-        end = min(n, idx + len(sig))
-        if end > idx:
-            bus[idx:end] += sig[: end - idx] * gain
-
-    kick = make_kick()
-    snare = make_snare()
-    for b in range(0, total_beats, 2):
-        place(kick, b, 0.9)
-    for b in range(1, total_beats, 2):
-        place(snare, b, 0.75)
-
-    step_dur = 0.5
-    steps = int(total_beats / step_dur)
-    for i in range(steps):
-        open_ = (i % 4 == 3)
-        hat = make_hat(seed=600 + i, open_=open_) * (0.16 if not open_ else 0.11)
-        place(hat, i * step_dur)
-    return bus
 
 
 # ---------------------------------------------------------------------------
@@ -487,13 +597,18 @@ def bell_arpeggio(notes: list[str], note_dur: float) -> np.ndarray:
 
 
 def make_bonus_chance_jingle() -> np.ndarray:
-    """チャンス目/ボーナス告知風の短い上昇アルペジオ（ベル+パッド+きらめき）。"""
+    """チャンス目/ボーナス告知風の短い上昇アルペジオ（短いライザー→ベル+パッド+プラック+きらめき）。"""
     notes = ["C5", "E5", "G5", "C6", "G5", "C6"]
+    riser = make_riser_buildup(0.5) * 0.5
     lead = bell_arpeggio(notes, 0.1)
-    dur = len(lead) / SR
+    pluck_layer = np.concatenate([
+        pluck_wave(NOTE_FREQS[n], 0.1, voices=4, detune_cents=12) for n in notes
+    ]) * 0.35
+    dur = max(len(lead), len(pluck_layer)) / SR
     pad = make_pad(["C4", "E4", "G4"], dur, voices=4, detune_cents=8, cutoff=1800) * 0.4
     sparkle = smooth_bandpass(white_noise(dur, seed=3), 4000, 9500) * exp_decay(dur, 0.22) * 0.18
-    return mix(lead, pad, sparkle, weights=[1.0, 1.0, 1.0])
+    body = mix(lead, pluck_layer, pad, sparkle, weights=[1.0, 1.0, 1.0, 1.0])
+    return mix(riser, np.pad(body, (len(riser), 0)), weights=[1.0, 1.0])
 
 
 def make_impact_hit(duration: float = 0.5) -> np.ndarray:
@@ -505,20 +620,42 @@ def make_impact_hit(duration: float = 0.5) -> np.ndarray:
 
 
 def make_big_win_fanfare() -> np.ndarray:
-    """大当り/ビッグボーナス風ファンファーレ: ブラス風ユニゾン主旋律 + ハモリ + パッド + コインの雨。"""
-    melody = brass_arpeggio(
-        ["C5", "E5", "G5", "C6", "G5", "E5", "C6", "E6", "G6"], 0.13, voices=4,
-    )
+    """大当り/ビッグボーナス風ファンファーレ: ライザー→インパクト→ブラス主旋律(+プラック二重)+ハモリ
+    +サイドチェインされたパッド+ディレイの掛かった余韻+コインの雨。ステレオバスを直接返す。"""
+    riser = make_riser_buildup(0.9)
+
+    melody_notes = ["C5", "E5", "G5", "C6", "G5", "E5", "C6", "E6", "G6"]
+    melody = brass_arpeggio(melody_notes, 0.13, voices=4)
+    pluck_double = np.concatenate([
+        pluck_wave(NOTE_FREQS[n], 0.13, voices=4, detune_cents=13) for n in melody_notes
+    ]) * 0.4
     harmony = brass_arpeggio(
         ["C4", "E4", "G4", "C5", "G4", "E4", "C5", "E5", "G5"], 0.13, voices=3,
     ) * 0.5
     dur = len(melody) / SR
+
     pad = make_pad(["C4", "E4", "G4"], dur, voices=5, detune_cents=10, cutoff=2600) * 0.35
-    impact = make_impact_hit(0.5)
-    fanfare = mix(melody, harmony, pad, weights=[1.0, 1.0, 1.0])
-    fanfare = mix(fanfare, impact, weights=[1.0, 0.8])
+    pump = sidechain_env(len(pad), bpm=60.0 / 0.13, hit_beats=list(range(9)), depth=0.4, release_beats=0.6)
+    pad = pad * pump[: len(pad)]
+
+    impact = gated_reverb(make_impact_hit(0.5), HALL_IR, gate_s=0.35, mix_amount=0.55)
+
+    core = mix(melody, pluck_double, harmony, pad, weights=[1.0, 1.0, 1.0, 1.0])
+    core = mix(core, impact, weights=[1.0, 0.9])
+    core = apply_reverb(core, HALL_IR, mix_amount=0.3)
+    core_echo = ping_pong_echo(core, delay_s=0.13, feedback=0.3, taps=4)
+
+    full = np.concatenate([riser, core])
     coin_tail = make_coin_payout(16)
-    return mix(fanfare, np.pad(coin_tail, (int(SR * dur * 0.55), 0)), weights=[1.0, 0.6])
+    coin_start = len(riser) + int(SR * dur * 0.55)
+    full = mix(full, np.pad(coin_tail, (coin_start, 0)), weights=[1.0, 0.6])
+
+    stereo = to_stereo(full, width_ms=20)
+    echo_padded = np.pad(core_echo, ((0, 0), (len(riser), 0)))
+    n = stereo.shape[1]
+    if echo_padded.shape[1] < n:
+        echo_padded = np.pad(echo_padded, ((0, 0), (0, n - echo_padded.shape[1])))
+    return stereo + echo_padded[:, :n] * 0.5
 
 
 def make_reg_win_fanfare() -> np.ndarray:
@@ -557,43 +694,104 @@ def render_track(steps: list[Step], bpm: float, tone_fn, octave_shift: int = 0, 
     return np.concatenate(out) if out else np.zeros(0)
 
 
-def make_bgm_loop(bpm: float, pad_chord: list[str], lead_gain: float, bass_gain: float,
-                   drum_gain: float, lead_voices: int, bass_voices: int) -> np.ndarray:
+def make_edm_drum_bus(total_beats: int, bpm: float) -> np.ndarray:
+    """EDM/トランス的な四つ打りキック + クラップ(ゲートリバーブ) + 16分ハットのドラムバス。"""
+    beat_dur = 60.0 / bpm
+    n = int(SR * total_beats * beat_dur)
+    bus = np.zeros(n)
+
+    def place(sig: np.ndarray, beat_pos: float, gain: float = 1.0) -> None:
+        idx = int(SR * beat_pos * beat_dur)
+        end = min(n, idx + len(sig))
+        if end > idx:
+            bus[idx:end] += sig[: end - idx] * gain
+
+    kick = make_kick()
+    clap = gated_reverb(make_clap(), ROOM_IR, gate_s=0.16, mix_amount=0.45)
+    for b in range(total_beats):
+        place(kick, b, 0.95)
+    for b in range(1, total_beats, 2):
+        place(clap, b, 0.8)
+
+    step_dur = 0.25
+    steps = int(total_beats / step_dur)
+    for i in range(steps):
+        open_ = (i % 8 == 7)
+        hat = make_hat(seed=800 + i, open_=open_) * (0.1 if not open_ else 0.15)
+        place(hat, i * step_dur)
+    return bus
+
+
+def make_pad_progression(chords: list[list[str]], seg_beats: float, bpm: float, voices: int = 6,
+                          detune_cents: float = 11.0, cutoff: float = 2400.0) -> np.ndarray:
+    """区間ごとにコードを切り替えるパッド（ベースのコード進行に追従させて厚みと動きを出す）。"""
+    beat_dur = 60.0 / bpm
+    seg_dur = seg_beats * beat_dur
+    segs = [make_pad(chord, seg_dur, voices=voices, detune_cents=detune_cents, cutoff=cutoff) for chord in chords]
+    return np.concatenate(segs)
+
+
+def make_bgm_loop_edm(bpm: float, chords: list[list[str]], lead_gain: float, bass_gain: float,
+                       drum_gain: float, lead_voices: int, bass_voices: int,
+                       pad_sidechain_depth: float = 0.7, bass_sidechain_depth: float = 0.45,
+                       riser_tail: bool = False) -> np.ndarray:
+    """EDM/トランス系 BGM ループ: 四つ打り+クラップ+ハット、サイドチェインでポンピングするパッド/ベース、
+    スーパーソウのプラックリード（ピンポンディレイ付き）、コード進行するプレートリバーブパッド。"""
+    total_beats = 8
+    beat_dur = 60.0 / bpm
+
+    drums = make_edm_drum_bus(total_beats, bpm) * drum_gain
+    n = len(drums)
+
+    kick_beats = list(range(total_beats))
+    duck_pad = sidechain_env(n, bpm, kick_beats, depth=pad_sidechain_depth, release_beats=0.45)
+    duck_bass = sidechain_env(n, bpm, kick_beats, depth=bass_sidechain_depth, release_beats=0.3)
+
+    pad = make_pad_progression(chords, seg_beats=total_beats / len(chords), bpm=bpm, voices=6,
+                                detune_cents=11, cutoff=2500) * 0.4
+    pad = pad[:n] if len(pad) >= n else np.pad(pad, (0, n - len(pad)))
+    pad = apply_reverb_circular(pad, PLATE_IR, mix_amount=0.35) * duck_pad
+
     lead_notes = ["C5", "E5", "G5", "E5", "F5", "A5", "G5", "E5",
-                   "C5", "D5", "E5", "G5", "D5", "F5", "E5", "C5"]
-    lead_tone = lambda f, d: unison_wave(f, d, rich_lead_wave, voices=lead_voices, detune_cents=7)
-    lead = render_track([Step(n, 0.5) for n in lead_notes], bpm, lead_tone, gain=lead_gain)
+                  "C5", "D5", "E5", "G5", "D5", "F5", "E5", "C5"]
+    lead_tone = lambda f, d: pluck_wave(f, d, voices=lead_voices, detune_cents=13)
+    lead = render_track([Step(nn, 0.5) for nn in lead_notes], bpm, lead_tone, gain=lead_gain)
+    lead = lead[:n] if len(lead) >= n else np.pad(lead, (0, n - len(lead)))
+    lead_echo = ping_pong_echo(lead, delay_s=beat_dur / 2, feedback=0.35, taps=4)
+    lead_echo = lead_echo[:, :n] if lead_echo.shape[1] >= n else np.pad(lead_echo, ((0, 0), (0, n - lead_echo.shape[1])))
 
     bass_notes = ["C4", "C4", "G4", "G4", "A4", "A4", "F4", "F4"]
-    bass_tone = lambda f, d: unison_wave(f, d, rich_bass_wave, voices=bass_voices, detune_cents=5)
-    bass = render_track([Step(n, 1.0) for n in bass_notes], bpm, bass_tone, octave_shift=-1,
-                         gain=bass_gain, sub_gain=0.35)
+    bass_tone = lambda f, d: wobble_bass(f, d, lfo_hz=bpm / 60.0, voices=bass_voices)
+    bass = render_track([Step(nn, 1.0) for nn in bass_notes], bpm, bass_tone, octave_shift=-1,
+                         gain=bass_gain, sub_gain=0.3)
+    bass = bass[:n] if len(bass) >= n else np.pad(bass, (0, n - len(bass)))
+    bass = bass * duck_bass
 
-    total_beats = 8
-    drums = build_drum_bus(total_beats, bpm) * drum_gain
+    mono_bus = mix(drums, pad, bass, weights=[1.0, 1.0, 1.0])
+    stereo = to_stereo(mono_bus, width_ms=14)
+    stereo = stereo + np.stack([lead, lead]) * 0.9 + lead_echo * 0.55
 
-    pad_duration = total_beats * (60.0 / bpm)
-    pad = make_pad(pad_chord, pad_duration, voices=5, detune_cents=9, cutoff=1900) * 0.3
+    if riser_tail:
+        riser = make_riser_buildup(min(1.4, n / SR * 0.4)) * 0.45
+        riser_stereo = to_stereo(riser, width_ms=20)
+        tail_start = max(0, n - riser_stereo.shape[1])
+        stereo[:, tail_start:] += riser_stereo[:, : n - tail_start]
 
-    length = max(len(lead), len(bass), len(drums), len(pad))
-    lead = np.pad(lead, (0, length - len(lead)))
-    bass = np.pad(bass, (0, length - len(bass)))
-    drums = np.pad(drums, (0, length - len(drums)))
-    pad = np.pad(pad, (0, length - len(pad)))
-    return mix(lead, bass, drums, pad, weights=[1.0, 1.0, 1.0, 1.0])
+    return stereo
 
 
 def make_bgm_normal_loop() -> np.ndarray:
-    return make_bgm_loop(bpm=118, pad_chord=["C4", "G4", "E4"], lead_gain=0.32, bass_gain=0.4,
-                          drum_gain=1.0, lead_voices=2, bass_voices=2)
+    chords = [["C4", "E4", "G4"], ["G4", "B4", "D5"], ["A4", "C5", "E5"], ["F4", "A4", "C5"]]
+    return make_bgm_loop_edm(bpm=124, chords=chords, lead_gain=0.34, bass_gain=0.4, drum_gain=1.0,
+                              lead_voices=5, bass_voices=2, pad_sidechain_depth=0.65, bass_sidechain_depth=0.4)
 
 
 def make_bgm_bonus_loop() -> np.ndarray:
-    """ボーナス中風の、テンポが速くユニゾンも厚い派手なループ。"""
-    base = make_bgm_loop(bpm=150, pad_chord=["C4", "G4", "E4", "B4"], lead_gain=0.36, bass_gain=0.45,
-                          drum_gain=1.15, lead_voices=3, bass_voices=3)
-    sparkle = smooth_bandpass(white_noise(len(base) / SR, seed=55), 5000, 11000) * 0.06
-    return mix(base, sparkle)
+    """ボーナス中風の、テンポが速く音圧・ユニゾンも厚い派手なループ（末尾にライザーで次周へのつなぎを演出）。"""
+    chords = [["C4", "E4", "G4"], ["G4", "B4", "D5"], ["A4", "C5", "E5"], ["F4", "A4", "C5"]]
+    return make_bgm_loop_edm(bpm=150, chords=chords, lead_gain=0.38, bass_gain=0.46, drum_gain=1.15,
+                              lead_voices=7, bass_voices=3, pad_sidechain_depth=0.75, bass_sidechain_depth=0.5,
+                              riser_tail=True)
 
 
 # ---------------------------------------------------------------------------
@@ -607,11 +805,12 @@ def main() -> None:
     export("reel_stop", make_reel_stop(), reverb_mix=0.15, width_ms=8, saturate=1.3)
     export("lever_click", make_lever_click(), reverb_mix=0.08, width_ms=6)
     export("button_beep", make_button_beep(), reverb_mix=0.1, width_ms=6)
+    export("buildup_riser", make_riser_buildup(1.6), reverb_ir=HALL_IR, reverb_mix=0.25, width_ms=20)
     export("bonus_chance_jingle", make_bonus_chance_jingle(), reverb_ir=HALL_IR, reverb_mix=0.3, width_ms=18)
-    export("big_win_fanfare", make_big_win_fanfare(), reverb_ir=HALL_IR, reverb_mix=0.32, width_ms=22, saturate=1.25)
+    export("big_win_fanfare", make_big_win_fanfare(), already_stereo=True, saturate=1.25)
     export("reg_win_fanfare", make_reg_win_fanfare(), reverb_ir=HALL_IR, reverb_mix=0.25, width_ms=16)
-    export("bgm_normal_loop", make_bgm_normal_loop(), loop=True, reverb_ir=HALL_IR, reverb_mix=0.16, width_ms=20, saturate=1.2)
-    export("bgm_bonus_loop", make_bgm_bonus_loop(), loop=True, reverb_ir=HALL_IR, reverb_mix=0.18, width_ms=20, saturate=1.25)
+    export("bgm_normal_loop", make_bgm_normal_loop(), loop=True, already_stereo=True, saturate=1.2)
+    export("bgm_bonus_loop", make_bgm_bonus_loop(), loop=True, already_stereo=True, saturate=1.25)
 
 
 if __name__ == "__main__":
