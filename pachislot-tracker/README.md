@@ -42,3 +42,16 @@ npm run build
 
 - **iPhone (Safari)**: 上記URLを開く → 共有ボタン → 「ホーム画面に追加」
 - **Android (Chrome)**: 上記URLを開く → メニュー → 「アプリをインストール」または「ホーム画面に追加」
+
+## パチスロ風サウンド生成（私用素材）
+
+`scripts/generate_sounds.py` は、実機音源を複製するのではなく NumPy の波形合成
+と FluidSynth(+ General MIDI サウンドフォント) で一からパチスロ風の効果音・
+BGM を作り、`public/sounds/generated/` に MP3 として書き出すスクリプトです。
+詳細は [`public/sounds/generated/README.md`](public/sounds/generated/README.md) を参照してください。
+
+```bash
+pip install numpy
+sudo apt-get install ffmpeg fluidsynth fluid-soundfont-gm musescore-general-soundfont
+python3 scripts/generate_sounds.py
+```
