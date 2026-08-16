@@ -6,13 +6,15 @@
 NumPy による波形合成でそれらしい雰囲気の音を一から作り、WAV -> MP3 に
 変換して書き出す。私用の作業用サウンド素材として利用する目的。
 
-音を「重厚」にするために以下を重ねている:
-- ユニゾン（デチューンした複数波形の重ね合わせ = コーラス感）
-- 倍音を積んだ加算合成（ベル/ブラス風のトーン）
-- サブベース（1オクターブ下の正弦波）で低域の厚み
-- 疑似リバーブ（合成インパルス応答との畳み込み）で空間の広がり
-- ソフトサチュレーション（tanh）でアナログ的な温かみ・音の「糊」
-- ハース効果によるステレオ化
+効果音は NumPy の波形合成（ユニゾン/デチューン、倍音を積んだ加算合成、サブベース、
+疑似リバーブ、ソフトサチュレーション、ステレオ化）で作る。BGM はそれに加えて、
+FluidSynth + General MIDI サウンドフォントでパッド/リード/ベースを実際のサンプル
+音色でレンダリングし（自作オシレーターだけでは出せない音色の生っぽさを補う）、
+自作のキック/クラップ/ハットによるドラム、サイドチェイン(ポンピング)、
+イントロ→ビルドアップ→ドロップという曲としての起伏を組み合わせている。
+
+必要な外部コマンド: ffmpeg, fluidsynth（+ General MIDI サウンドフォント。
+`sudo apt-get install ffmpeg fluidsynth fluid-soundfont-gm musescore-general-soundfont`）
 
 使い方:
     python3 scripts/generate_sounds.py
@@ -27,7 +29,6 @@ import math
 import os
 import subprocess
 import wave
-from dataclasses import dataclass
 
 import numpy as np
 
@@ -385,15 +386,6 @@ def pluck_wave(freq: float, duration: float, voices: int = 5, detune_cents: floa
     return time_varying_lowpass(raw, lambda t: 7000 * math.exp(-t / decay_tau) + 700)
 
 
-def wobble_bass(freq: float, duration: float, lfo_hz: float = 4.0, cutoff_base: float = 350.0,
-                 cutoff_range: float = 900.0, voices: int = 3) -> np.ndarray:
-    """LFO でローパスのカットオフを揺らす EDM 的なうねりベース。"""
-    raw = unison_wave(freq, duration, sawtooth, voices=voices, detune_cents=6)
-    return time_varying_lowpass(
-        raw, lambda t: cutoff_base + cutoff_range * (0.5 + 0.5 * math.sin(2 * math.pi * lfo_hz * t)),
-    )
-
-
 def sidechain_env(n_samples: int, bpm: float, hit_beats: list[float], depth: float = 0.65,
                    release_beats: float = 0.4, attack_s: float = 0.004) -> np.ndarray:
     """キックに合わせて他レイヤーを一瞬ダッキングさせる「ポンピング」エンベロープ。"""
@@ -667,35 +659,179 @@ def make_reg_win_fanfare() -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# BGM ループ（簡易シーケンサー）
+# MIDI + FluidSynth: パッド/リード/ベースを General MIDI サウンドフォントの
+# 実サンプル音色でレンダリングする（自作オシレーターの「安っぽさ」を解消する層）
 # ---------------------------------------------------------------------------
 
-@dataclass
-class Step:
-    note: str | None  # None = 休符
-    beats: float
+SOUNDFONT_CANDIDATES = [
+    "/usr/share/sounds/sf2/FluidR3_GM.sf2",
+    "/usr/share/sounds/sf3/MuseScore_General.sf3",
+    "/usr/share/sounds/sf2/default-GM.sf2",
+]
+
+LEAD_SAW_PROGRAM = 81   # GM #82 Lead 2 (sawtooth)
+PAD_WARM_PROGRAM = 89   # GM #90 Pad 2 (warm)
+BASS_PROGRAM = 39       # GM #40 Synth Bass 2
+
+PITCH_CLASS = {"C": 0, "C#": 1, "D": 2, "D#": 3, "E": 4, "F": 5, "F#": 6,
+               "G": 7, "G#": 8, "A": 9, "A#": 10, "B": 11}
+
+# トランス系アンセムに定番の i-VII-VI-V(ナチュラル/ハーモニックマイナー混在)進行。
+# 定番の I-V-vi-IV(C-G-Am-F)より現代のジャンルに近い響きになる。
+TRANCE_PROGRESSION = [
+    ["A3", "C4", "E4"],   # Am (i)
+    ["G3", "B3", "D4"],   # G  (VII)
+    ["F3", "A3", "C4"],   # F  (VI)
+    ["E3", "G#3", "B3"],  # E  (V, ハーモニックマイナーの導音を使った終止感)
+]
+BASS_ROOTS = ["A2", "G2", "F2", "E2"]
 
 
-def render_track(steps: list[Step], bpm: float, tone_fn, octave_shift: int = 0, gain: float = 1.0,
-                  sub_gain: float = 0.0) -> np.ndarray:
-    beat_dur = 60.0 / bpm
+def find_soundfont() -> str:
+    for path in SOUNDFONT_CANDIDATES:
+        if os.path.exists(path):
+            return path
+    raise FileNotFoundError(
+        "General MIDI サウンドフォントが見つかりません。"
+        "`sudo apt-get install fluid-soundfont-gm musescore-general-soundfont` でインストールしてください。",
+    )
+
+
+def midi_num(name: str) -> int:
+    pc = name[:2] if len(name) > 1 and name[1] == "#" else name[0]
+    octave = int(name[len(pc):])
+    return 12 * (octave + 1) + PITCH_CLASS[pc]
+
+
+def _vlq(n: int) -> bytes:
+    out = [n & 0x7F]
+    n >>= 7
+    while n:
+        out.insert(0, (n & 0x7F) | 0x80)
+        n >>= 7
+    return bytes(out)
+
+
+def _midi_track(events: list[tuple[int, bytes]]) -> bytes:
+    data = b"".join(_vlq(delta) + ev for delta, ev in events)
+    data += _vlq(0) + b"\xff\x2f\x00"
+    return b"MTrk" + len(data).to_bytes(4, "big") + data
+
+
+class MidiSong:
+    """外部ライブラリなしで書く最小限の Type-1 MIDI ファイルビルダー。"""
+
+    def __init__(self, bpm: float, ticks_per_beat: int = 480) -> None:
+        self.ticks_per_beat = ticks_per_beat
+        micros_per_beat = int(60_000_000 / bpm)
+        tempo_event = (0, b"\xff\x51\x03" + micros_per_beat.to_bytes(3, "big"))
+        self.tracks: list[bytes] = [_midi_track([tempo_event])]
+
+    def add_track(self, channel: int, program: int, notes: list[tuple[int, float, float, int]]) -> None:
+        """notes: (MIDI ノート番号, 開始拍, 長さ拍, ベロシティ) のリスト。"""
+        raw: list[tuple[int, bytes]] = [(0, bytes([0xC0 | channel, program]))]
+        for note, start, dur, vel in notes:
+            on_tick = max(0, int(round(start * self.ticks_per_beat)))
+            off_tick = max(on_tick + 1, int(round((start + dur) * self.ticks_per_beat)))
+            raw.append((on_tick, bytes([0x90 | channel, note, vel])))
+            raw.append((off_tick, bytes([0x80 | channel, note, 0])))
+        raw.sort(key=lambda e: e[0])
+        events, prev = [], 0
+        for tick, ev in raw:
+            events.append((tick - prev, ev))
+            prev = tick
+        self.tracks.append(_midi_track(events))
+
+    def save(self, path: str) -> None:
+        header = (b"MThd" + (6).to_bytes(4, "big") + (1).to_bytes(2, "big")
+                  + len(self.tracks).to_bytes(2, "big") + self.ticks_per_beat.to_bytes(2, "big"))
+        with open(path, "wb") as f:
+            f.write(header)
+            for t in self.tracks:
+                f.write(t)
+
+
+def render_midi_to_stereo(song: MidiSong) -> np.ndarray:
+    """MIDI を FluidSynth + GM サウンドフォントでレンダリングし、ステレオ numpy 配列として読み込む。"""
+    soundfont = find_soundfont()
+    tmp_dir = "/tmp/pachislot_midi_render"
+    os.makedirs(tmp_dir, exist_ok=True)
+    token = f"{os.getpid()}_{id(song)}"
+    midi_path = os.path.join(tmp_dir, f"song_{token}.mid")
+    wav_path = os.path.join(tmp_dir, f"song_{token}.wav")
+    song.save(midi_path)
+    try:
+        subprocess.run(
+            ["fluidsynth", "-ni", "-F", wav_path, "-r", str(SR), "-g", "1.0", soundfont, midi_path],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        with wave.open(wav_path, "rb") as wf:
+            n_channels = wf.getnchannels()
+            pcm = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16).astype(np.float64) / 32768.0
+    finally:
+        for p in (midi_path, wav_path):
+            if os.path.exists(p):
+                os.remove(p)
+    return np.stack([pcm[0::2], pcm[1::2]]) if n_channels == 2 else np.stack([pcm, pcm])
+
+
+def humanize(notes: list[tuple[int, float, float, int]], swing: float = 0.0, timing_jitter: float = 0.008,
+             velocity_jitter: int = 10, seed: int = 0) -> list[tuple[int, float, float, int]]:
+    """完全にグリッド通りの「打ち込み臭さ」を消すためのスウィング+タイミング/ベロシティのゆらぎ。"""
+    rng = np.random.default_rng(seed)
     out = []
-    for step in steps:
-        dur = step.beats * beat_dur
-        if step.note is None:
-            out.append(np.zeros(int(SR * dur)))
-            continue
-        freq = NOTE_FREQS[step.note] * (2 ** octave_shift)
-        env = adsr(dur, 0.005, dur * 0.15, 0.5, dur * 0.25)
-        tone = tone_fn(freq, dur) * env
-        if sub_gain > 0:
-            tone = tone + sine(freq / 2, dur) * env * sub_gain
-        out.append(tone * gain)
-    return np.concatenate(out) if out else np.zeros(0)
+    for note, start, dur, vel in notes:
+        sixteenth = round((start % 1.0) * 4) % 4
+        s = start + (swing * 0.125 if swing > 0 and sixteenth in (1, 3) else 0.0)
+        s += rng.uniform(-timing_jitter, timing_jitter)
+        v = int(np.clip(vel + rng.uniform(-velocity_jitter, velocity_jitter), 1, 127))
+        out.append((note, max(0.0, s), dur, v))
+    return out
 
 
-def make_edm_drum_bus(total_beats: int, bpm: float) -> np.ndarray:
-    """EDM/トランス的な四つ打りキック + クラップ(ゲートリバーブ) + 16分ハットのドラムバス。"""
+def build_pad_notes(start_beat: float, chord: list[str], length_beats: float, velocity: int = 70) -> list:
+    if length_beats <= 0:
+        return []
+    return [(midi_num(n), start_beat, length_beats, velocity) for n in chord]
+
+
+def build_lead_arp(start_beat: float, length_beats: float, chord: list[str], register_shift: int = 12,
+                    step: float = 0.25, pattern: tuple[int, ...] = (0, 1, 2, 1), velocity: int = 100) -> list:
+    notes, t, i = [], start_beat, 0
+    while t < start_beat + length_beats - 1e-6:
+        name = chord[pattern[i % len(pattern)] % len(chord)]
+        notes.append((midi_num(name) + register_shift, t, step * 0.9, velocity))
+        t += step
+        i += 1
+    return notes
+
+
+def build_lead_sparse(start_beat: float, length_beats: float, chord: list[str], register_shift: int = 12,
+                       step: float = 1.0, velocity: int = 72) -> list:
+    notes, t, i = [], start_beat, 0
+    while t < start_beat + length_beats - 1e-6:
+        notes.append((midi_num(chord[i % len(chord)]) + register_shift, t, step * 0.8, velocity))
+        t += step
+        i += 1
+    return notes
+
+
+def build_bass_pulse(start_beat: float, length_beats: float, root_name: str, step: float = 0.5,
+                      velocity: int = 105) -> list:
+    notes, t = [], start_beat
+    while t < start_beat + length_beats - 1e-6:
+        notes.append((midi_num(root_name), t, step * 0.85, velocity))
+        t += step
+    return notes
+
+
+# ---------------------------------------------------------------------------
+# BGM: 自作ドラム(パンチ重視) + サウンドフォント(パッド/リード/ベース) + サイドチェイン
+# ---------------------------------------------------------------------------
+
+def build_song_drum_bus(total_beats: float, bpm: float, drop_start_beat: float, build_start_beat: float,
+                         swing: float = 0.0) -> np.ndarray:
+    """ビルド区間はハットのみ密度を上げて煽り、ドロップ区間で四つ打り+クラップが本格的に入る構成。"""
     beat_dur = 60.0 / bpm
     n = int(SR * total_beats * beat_dur)
     bus = np.zeros(n)
@@ -708,71 +844,95 @@ def make_edm_drum_bus(total_beats: int, bpm: float) -> np.ndarray:
 
     kick = make_kick()
     clap = gated_reverb(make_clap(), ROOM_IR, gate_s=0.16, mix_amount=0.45)
-    for b in range(total_beats):
-        place(kick, b, 0.95)
-    for b in range(1, total_beats, 2):
-        place(clap, b, 0.8)
 
-    step_dur = 0.25
-    steps = int(total_beats / step_dur)
-    for i in range(steps):
-        open_ = (i % 8 == 7)
-        hat = make_hat(seed=800 + i, open_=open_) * (0.1 if not open_ else 0.15)
-        place(hat, i * step_dur)
+    b = drop_start_beat
+    while b < total_beats - 1e-6:
+        place(kick, b, 0.95)
+        b += 1.0
+    b = drop_start_beat + 1
+    while b < total_beats - 1e-6:
+        place(clap, b, 0.8)
+        b += 2.0
+
+    hat_step = 0.25
+    b, i = build_start_beat, 0
+    while b < total_beats - 1e-6:
+        sixteenth = i % 4
+        swung = b + (swing * 0.125 if sixteenth in (1, 3) else 0.0)
+        in_build = b < drop_start_beat
+        if in_build:
+            span = max(drop_start_beat - build_start_beat, 1e-6)
+            progress = (b - build_start_beat) / span
+            gain = 0.05 + 0.14 * progress
+            open_ = False
+        else:
+            open_ = (i % 8 == 7)
+            gain = 0.16 if open_ else 0.1
+        hat = make_hat(seed=900 + i, open_=open_) * gain
+        place(hat, swung)
+        b += hat_step
+        i += 1
+
+    impact = gated_reverb(make_impact_hit(0.35), ROOM_IR, gate_s=0.3, mix_amount=0.4)
+    place(impact, max(0.0, drop_start_beat - 0.02), 0.9)
     return bus
 
 
-def make_pad_progression(chords: list[list[str]], seg_beats: float, bpm: float, voices: int = 6,
-                          detune_cents: float = 11.0, cutoff: float = 2400.0) -> np.ndarray:
-    """区間ごとにコードを切り替えるパッド（ベースのコード進行に追従させて厚みと動きを出す）。"""
-    beat_dur = 60.0 / bpm
-    seg_dur = seg_beats * beat_dur
-    segs = [make_pad(chord, seg_dur, voices=voices, detune_cents=detune_cents, cutoff=cutoff) for chord in chords]
-    return np.concatenate(segs)
+def make_bgm_arrangement(bpm: float, intro_bars: int, build_bars: int, drop_bars: int, swing: float,
+                          sidechain_depth: float, riser_tail: bool, seed: int) -> np.ndarray:
+    """イントロ(パッドのみ)→ビルド(ハット+スパースなリード)→ドロップ(四つ打り+サイドチェイン+アルペジオ)
+    という起伏のある構成で、パッド/リード/ベースは FluidSynth の GM サウンドフォントで実音色レンダリングする。"""
+    beats_per_bar = 4
+    intro_beats = intro_bars * beats_per_bar
+    build_beats = build_bars * beats_per_bar
+    drop_beats = drop_bars * beats_per_bar
+    total_beats = intro_beats + build_beats + drop_beats
+    build_start = intro_beats
+    drop_start = intro_beats + build_beats
 
+    pad_notes: list = []
+    lead_notes: list = []
+    bass_notes: list = []
 
-def make_bgm_loop_edm(bpm: float, chords: list[list[str]], lead_gain: float, bass_gain: float,
-                       drum_gain: float, lead_voices: int, bass_voices: int,
-                       pad_sidechain_depth: float = 0.7, bass_sidechain_depth: float = 0.45,
-                       riser_tail: bool = False) -> np.ndarray:
-    """EDM/トランス系 BGM ループ: 四つ打り+クラップ+ハット、サイドチェインでポンピングするパッド/ベース、
-    スーパーソウのプラックリード（ピンポンディレイ付き）、コード進行するプレートリバーブパッド。"""
-    total_beats = 8
-    beat_dur = 60.0 / bpm
+    if intro_beats > 0:
+        pad_notes += build_pad_notes(0.0, TRANCE_PROGRESSION[0], intro_beats, velocity=52)
 
-    drums = make_edm_drum_bus(total_beats, bpm) * drum_gain
-    n = len(drums)
+    half = build_beats / 2
+    if half > 0:
+        pad_notes += build_pad_notes(build_start, TRANCE_PROGRESSION[0], half, velocity=62)
+        pad_notes += build_pad_notes(build_start + half, TRANCE_PROGRESSION[1], half, velocity=68)
+        lead_notes += build_lead_sparse(build_start, build_beats, TRANCE_PROGRESSION[0], step=1.0, velocity=68)
 
-    kick_beats = list(range(total_beats))
-    duck_pad = sidechain_env(n, bpm, kick_beats, depth=pad_sidechain_depth, release_beats=0.45)
-    duck_bass = sidechain_env(n, bpm, kick_beats, depth=bass_sidechain_depth, release_beats=0.3)
+    chord_dur = drop_beats / len(TRANCE_PROGRESSION)
+    for i, chord in enumerate(TRANCE_PROGRESSION):
+        seg_start = drop_start + i * chord_dur
+        pad_notes += build_pad_notes(seg_start, chord, chord_dur, velocity=78)
+        lead_notes += build_lead_arp(seg_start, chord_dur, chord, step=0.25, velocity=98)
+        bass_notes += build_bass_pulse(seg_start, chord_dur, BASS_ROOTS[i], step=0.5, velocity=104)
 
-    pad = make_pad_progression(chords, seg_beats=total_beats / len(chords), bpm=bpm, voices=6,
-                                detune_cents=11, cutoff=2500) * 0.4
-    pad = pad[:n] if len(pad) >= n else np.pad(pad, (0, n - len(pad)))
-    pad = apply_reverb_circular(pad, PLATE_IR, mix_amount=0.35) * duck_pad
+    lead_notes = humanize(lead_notes, swing=swing, timing_jitter=0.007, velocity_jitter=10, seed=seed)
+    bass_notes = humanize(bass_notes, swing=0.0, timing_jitter=0.005, velocity_jitter=8, seed=seed + 1)
+    pad_notes = humanize(pad_notes, swing=0.0, timing_jitter=0.0, velocity_jitter=4, seed=seed + 2)
 
-    lead_notes = ["C5", "E5", "G5", "E5", "F5", "A5", "G5", "E5",
-                  "C5", "D5", "E5", "G5", "D5", "F5", "E5", "C5"]
-    lead_tone = lambda f, d: pluck_wave(f, d, voices=lead_voices, detune_cents=13)
-    lead = render_track([Step(nn, 0.5) for nn in lead_notes], bpm, lead_tone, gain=lead_gain)
-    lead = lead[:n] if len(lead) >= n else np.pad(lead, (0, n - len(lead)))
-    lead_echo = ping_pong_echo(lead, delay_s=beat_dur / 2, feedback=0.35, taps=4)
-    lead_echo = lead_echo[:, :n] if lead_echo.shape[1] >= n else np.pad(lead_echo, ((0, 0), (0, n - lead_echo.shape[1])))
+    song = MidiSong(bpm)
+    song.add_track(0, PAD_WARM_PROGRAM, pad_notes)
+    song.add_track(1, LEAD_SAW_PROGRAM, lead_notes)
+    song.add_track(2, BASS_PROGRAM, bass_notes)
+    melodic = render_midi_to_stereo(song)
 
-    bass_notes = ["C4", "C4", "G4", "G4", "A4", "A4", "F4", "F4"]
-    bass_tone = lambda f, d: wobble_bass(f, d, lfo_hz=bpm / 60.0, voices=bass_voices)
-    bass = render_track([Step(nn, 1.0) for nn in bass_notes], bpm, bass_tone, octave_shift=-1,
-                         gain=bass_gain, sub_gain=0.3)
-    bass = bass[:n] if len(bass) >= n else np.pad(bass, (0, n - len(bass)))
-    bass = bass * duck_bass
+    n = int(SR * total_beats * (60.0 / bpm))
+    melodic = melodic[:, :n] if melodic.shape[1] >= n else np.pad(melodic, ((0, 0), (0, n - melodic.shape[1])))
 
-    mono_bus = mix(drums, pad, bass, weights=[1.0, 1.0, 1.0])
-    stereo = to_stereo(mono_bus, width_ms=14)
-    stereo = stereo + np.stack([lead, lead]) * 0.9 + lead_echo * 0.55
+    drums = build_song_drum_bus(total_beats, bpm, drop_start, build_start, swing=swing)
+    drums = drums[:n] if len(drums) >= n else np.pad(drums, (0, n - len(drums)))
+
+    kick_beats = list(np.arange(drop_start, total_beats, 1.0))
+    duck = sidechain_env(n, bpm, kick_beats, depth=sidechain_depth, release_beats=0.4)
+
+    stereo = to_stereo(drums, width_ms=12) + melodic * duck
 
     if riser_tail:
-        riser = make_riser_buildup(min(1.4, n / SR * 0.4)) * 0.45
+        riser = make_riser_buildup(min(1.6, n / SR * 0.15)) * 0.4
         riser_stereo = to_stereo(riser, width_ms=20)
         tail_start = max(0, n - riser_stereo.shape[1])
         stereo[:, tail_start:] += riser_stereo[:, : n - tail_start]
@@ -781,17 +941,16 @@ def make_bgm_loop_edm(bpm: float, chords: list[list[str]], lead_gain: float, bas
 
 
 def make_bgm_normal_loop() -> np.ndarray:
-    chords = [["C4", "E4", "G4"], ["G4", "B4", "D5"], ["A4", "C5", "E5"], ["F4", "A4", "C5"]]
-    return make_bgm_loop_edm(bpm=124, chords=chords, lead_gain=0.34, bass_gain=0.4, drum_gain=1.0,
-                              lead_voices=5, bass_voices=2, pad_sidechain_depth=0.65, bass_sidechain_depth=0.4)
+    """通常時 BGM: イントロ→ビルドアップ→ドロップの起伏を持つ 12 小節ループ(124 BPM)。"""
+    return make_bgm_arrangement(bpm=124, intro_bars=2, build_bars=2, drop_bars=8, swing=0.12,
+                                 sidechain_depth=0.55, riser_tail=False, seed=1)
 
 
 def make_bgm_bonus_loop() -> np.ndarray:
-    """ボーナス中風の、テンポが速く音圧・ユニゾンも厚い派手なループ（末尾にライザーで次周へのつなぎを演出）。"""
-    chords = [["C4", "E4", "G4"], ["G4", "B4", "D5"], ["A4", "C5", "E5"], ["F4", "A4", "C5"]]
-    return make_bgm_loop_edm(bpm=150, chords=chords, lead_gain=0.38, bass_gain=0.46, drum_gain=1.15,
-                              lead_voices=7, bass_voices=3, pad_sidechain_depth=0.75, bass_sidechain_depth=0.5,
-                              riser_tail=True)
+    """ボーナス中 BGM: イントロなしで煽りから即ドロップに入る 8 小節ループ(150 BPM)。
+    末尾にライザーを足し、周回時のつなぎに緊張感を持たせる。"""
+    return make_bgm_arrangement(bpm=150, intro_bars=0, build_bars=2, drop_bars=6, swing=0.14,
+                                 sidechain_depth=0.65, riser_tail=True, seed=2)
 
 
 # ---------------------------------------------------------------------------
