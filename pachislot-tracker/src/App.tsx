@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { CalendarScreen } from './screens/CalendarScreen';
 import { DayScreen } from './screens/DayScreen';
+import { StatsScreen } from './screens/StatsScreen';
 import { useEntries } from './hooks/useEntries';
 import type { EntryDraft } from './types/entry';
 
@@ -19,6 +20,7 @@ function toEntryFields(dateKey: string, draft: EntryDraft) {
 function App() {
   const { entries, entriesByDate, hallNames, machineNames, addEntry, updateEntry, deleteEntry } = useEntries();
   const [selectedDate, setSelectedDate] = useState<string | null>(null);
+  const [showStats, setShowStats] = useState(false);
 
   if (selectedDate) {
     const dayEntries = entriesByDate.get(selectedDate) ?? [];
@@ -36,7 +38,11 @@ function App() {
     );
   }
 
-  return <CalendarScreen entries={entries} onSelectDate={setSelectedDate} />;
+  if (showStats) {
+    return <StatsScreen entries={entries} onBack={() => setShowStats(false)} />;
+  }
+
+  return <CalendarScreen entries={entries} onSelectDate={setSelectedDate} onOpenStats={() => setShowStats(true)} />;
 }
 
 export default App;

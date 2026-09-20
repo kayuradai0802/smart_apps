@@ -1,6 +1,7 @@
 import { useMemo } from 'react';
 import { useLocalStorage } from './useLocalStorage';
 import type { PachislotEntry } from '../types/entry';
+import { parseDateKey } from '../utils/date';
 
 const STORAGE_KEY = 'pachislot-entries';
 
@@ -62,4 +63,54 @@ export function entriesForMonth(entries: PachislotEntry[], year: number, month: 
 export function entriesForYear(entries: PachislotEntry[], year: number): PachislotEntry[] {
   const prefix = `${year}-`;
   return entries.filter((e) => e.date.startsWith(prefix));
+}
+
+export interface Totals {
+  investment: number;
+  recovery: number;
+  profit: number;
+  count: number;
+}
+
+function emptyTotals(): Totals {
+  return { investment: 0, recovery: 0, profit: 0, count: 0 };
+}
+
+function addEntryToTotals(totals: Totals, entry: PachislotEntry): Totals {
+  totals.investment += entry.investment;
+  totals.recovery += entry.recovery;
+  totals.profit += profit(entry);
+  totals.count += 1;
+  return totals;
+}
+
+export function sumTotals(entries: PachislotEntry[]): Totals {
+  return entries.reduce(addEntryToTotals, emptyTotals());
+}
+
+export interface MonthlyTotals extends Totals {
+  month: number;
+}
+
+export function monthlyTotalsForYear(entries: PachislotEntry[], year: number): MonthlyTotals[] {
+  const months: MonthlyTotals[] = Array.from({ length: 12 }, (_, month) => ({ month, ...emptyTotals() }));
+  for (const entry of entriesForYear(entries, year)) {
+    const { month } = parseDateKey(entry.date);
+    addEntryToTotals(months[month], entry);
+  }
+  return months;
+}
+
+export interface MachineTotals extends Totals {
+  machineName: string;
+}
+
+export function machineTotals(entries: PachislotEntry[]): MachineTotals[] {
+  const map = new Map<string, MachineTotals>();
+  for (const entry of entries) {
+    const existing = map.get(entry.machineName) ?? { machineName: entry.machineName, ...emptyTotals() };
+    addEntryToTotals(existing, entry);
+    map.set(entry.machineName, existing);
+  }
+  return Array.from(map.values()).sort((a, b) => b.profit - a.profit);
 }
