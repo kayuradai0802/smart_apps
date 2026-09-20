@@ -1,7 +1,9 @@
+import type { Totals } from '../hooks/useEntries';
+
 interface SummaryBarProps {
   year: number;
-  yearProfit: number;
-  monthProfit: number;
+  yearTotals: Totals;
+  monthTotals: Totals;
 }
 
 function formatYen(amount: number): string {
@@ -9,21 +11,26 @@ function formatYen(amount: number): string {
   return `${sign}${Math.abs(amount).toLocaleString()}円`;
 }
 
-export function SummaryBar({ year, yearProfit, monthProfit }: SummaryBarProps) {
+function SummaryCard({ label, totals }: { label: string; totals: Totals }) {
+  return (
+    <div className="summary-card">
+      <div className="summary-label">{label}</div>
+      <div className={`summary-value ${totals.profit < 0 ? 'negative' : 'positive'}`}>
+        {formatYen(totals.profit)}
+      </div>
+      <div className="summary-breakdown">
+        <span>投資合計 {totals.investment.toLocaleString()}円</span>
+        <span>回収合計 {totals.recovery.toLocaleString()}円</span>
+      </div>
+    </div>
+  );
+}
+
+export function SummaryBar({ year, yearTotals, monthTotals }: SummaryBarProps) {
   return (
     <div className="summary-bar">
-      <div className="summary-card">
-        <div className="summary-label">{year}年 年間収支</div>
-        <div className={`summary-value ${yearProfit < 0 ? 'negative' : 'positive'}`}>
-          {formatYen(yearProfit)}
-        </div>
-      </div>
-      <div className="summary-card">
-        <div className="summary-label">今月の収支</div>
-        <div className={`summary-value ${monthProfit < 0 ? 'negative' : 'positive'}`}>
-          {formatYen(monthProfit)}
-        </div>
-      </div>
+      <SummaryCard label={`${year}年 年間収支`} totals={yearTotals} />
+      <SummaryCard label="今月の収支" totals={monthTotals} />
     </div>
   );
 }

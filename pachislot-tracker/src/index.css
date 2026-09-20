@@ -74,6 +74,23 @@ body {
   cursor: pointer;
 }
 
+.stats-button {
+  position: absolute;
+  right: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: rgba(255, 255, 255, 0.15);
+  border: none;
+  color: #fff;
+  width: 36px;
+  height: 36px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
 /* Summary bar: yearly + monthly side by side */
 .summary-bar {
   display: flex;
@@ -99,6 +116,17 @@ body {
 .summary-value {
   font-size: 20px;
   font-weight: 700;
+}
+
+.summary-breakdown {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--text-muted);
 }
 
 .positive {
@@ -217,6 +245,141 @@ body {
   display: block;
   font-size: 11px;
   margin-top: 4px;
+}
+
+/* Bar chart */
+.bar-chart-wrap {
+  background: #fff;
+  padding: 16px;
+}
+
+.bar-chart-legend {
+  display: flex;
+  gap: 16px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.legend-swatch {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+}
+
+.legend-swatch.investment {
+  background: var(--teal);
+}
+
+.legend-swatch.recovery {
+  background: var(--orange);
+}
+
+.bar-chart-scale {
+  font-size: 11px;
+  color: var(--text-muted);
+  text-align: right;
+  margin-top: 4px;
+}
+
+.bar-chart {
+  display: flex;
+  align-items: flex-end;
+  gap: 4px;
+  height: 160px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.bar-chart-col {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  height: 100%;
+}
+
+.bar-chart-bars {
+  flex: 1;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  gap: 2px;
+  width: 100%;
+}
+
+.bar-chart-bar {
+  width: 40%;
+  min-height: 1px;
+  border-radius: 2px 2px 0 0;
+}
+
+.bar-chart-bar.investment {
+  background: var(--teal);
+}
+
+.bar-chart-bar.recovery {
+  background: var(--orange);
+}
+
+.bar-chart-month-label {
+  font-size: 9px;
+  color: var(--text-muted);
+  margin-top: 4px;
+}
+
+/* Stats screen */
+.stats-section {
+  background: #fff;
+  margin-top: 10px;
+}
+
+.stats-section-title {
+  font-size: 14px;
+  font-weight: 700;
+  padding: 14px 16px 0;
+}
+
+.machine-rank-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.machine-rank-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  gap: 10px;
+}
+
+.machine-rank-row:last-child {
+  border-bottom: none;
+}
+
+.machine-rank-name {
+  font-weight: 600;
+  font-size: 14px;
+}
+
+.machine-rank-meta {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+
+.machine-rank-profit {
+  font-size: 15px;
+  font-weight: 700;
+  white-space: nowrap;
 }
 
 /* Day screen */
