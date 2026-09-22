@@ -101,16 +101,33 @@ export function monthlyTotalsForYear(entries: PachislotEntry[], year: number): M
   return months;
 }
 
+function groupTotalsByProfit<K extends string, T extends Totals & Record<K, string>>(
+  entries: PachislotEntry[],
+  key: K,
+  getGroupName: (entry: PachislotEntry) => string,
+): T[] {
+  const map = new Map<string, T>();
+  for (const entry of entries) {
+    const groupName = getGroupName(entry);
+    const existing = map.get(groupName) ?? ({ [key]: groupName, ...emptyTotals() } as T);
+    addEntryToTotals(existing, entry);
+    map.set(groupName, existing);
+  }
+  return Array.from(map.values()).sort((a, b) => b.profit - a.profit);
+}
+
 export interface MachineTotals extends Totals {
   machineName: string;
 }
 
 export function machineTotals(entries: PachislotEntry[]): MachineTotals[] {
-  const map = new Map<string, MachineTotals>();
-  for (const entry of entries) {
-    const existing = map.get(entry.machineName) ?? { machineName: entry.machineName, ...emptyTotals() };
-    addEntryToTotals(existing, entry);
-    map.set(entry.machineName, existing);
-  }
-  return Array.from(map.values()).sort((a, b) => b.profit - a.profit);
+  return groupTotalsByProfit(entries, 'machineName', (e) => e.machineName);
+}
+
+export interface HallTotals extends Totals {
+  hallName: string;
+}
+
+export function hallTotals(entries: PachislotEntry[]): HallTotals[] {
+  return groupTotalsByProfit(entries, 'hallName', (e) => e.hallName);
 }

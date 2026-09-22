@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react';
 import { MonthlyBarChart } from '../components/MonthlyBarChart';
-import { machineTotals, monthlyTotalsForYear } from '../hooks/useEntries';
+import { HallProfitChart } from '../components/HallProfitChart';
+import { hallTotals, machineTotals, monthlyTotalsForYear } from '../hooks/useEntries';
 import type { PachislotEntry } from '../types/entry';
 
 interface StatsScreenProps {
@@ -17,6 +18,7 @@ export function StatsScreen({ entries, onBack }: StatsScreenProps) {
   const [year, setYear] = useState(() => new Date().getFullYear());
 
   const monthly = useMemo(() => monthlyTotalsForYear(entries, year), [entries, year]);
+  const halls = useMemo(() => hallTotals(entries), [entries]);
   const machines = useMemo(() => machineTotals(entries), [entries]);
 
   return (
@@ -43,6 +45,15 @@ export function StatsScreen({ entries, onBack }: StatsScreenProps) {
       <div className="stats-section">
         <div className="stats-section-title">月別の投資・回収</div>
         <MonthlyBarChart data={monthly} />
+      </div>
+
+      <div className="stats-section">
+        <div className="stats-section-title">ホール別収支（全期間）</div>
+        {halls.length === 0 ? (
+          <p className="empty-message">まだ記録がありません</p>
+        ) : (
+          <HallProfitChart data={halls} />
+        )}
       </div>
 
       <div className="stats-section">

@@ -382,6 +382,67 @@ body {
   white-space: nowrap;
 }
 
+/* Hall profit chart */
+.hall-chart {
+  display: flex;
+  flex-direction: column;
+  padding: 4px 16px 14px;
+}
+
+.hall-chart-row {
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.hall-chart-row:last-child {
+  border-bottom: none;
+}
+
+.hall-chart-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.hall-chart-name {
+  font-weight: 600;
+  font-size: 14px;
+}
+
+.hall-chart-value {
+  font-size: 15px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.hall-chart-track {
+  height: 8px;
+  background: var(--cream);
+  border-radius: 4px;
+  margin-top: 6px;
+  overflow: hidden;
+}
+
+.hall-chart-bar {
+  height: 100%;
+  border-radius: 4px;
+}
+
+.hall-chart-bar.positive {
+  background: var(--teal);
+}
+
+.hall-chart-bar.negative {
+  background: var(--red);
+}
+
+.hall-chart-meta {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 6px;
+}
+
 /* Day screen */
 .day-summary {
   display: flex;
